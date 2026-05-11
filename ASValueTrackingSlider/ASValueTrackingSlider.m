@@ -20,6 +20,19 @@
     UIColor *_popUpViewColor;
     NSArray *_keyTimes;
     CGFloat _valueRange;
+    
+    CGSize _cachedPopUpViewSize;
+    BOOL _cachedPopUpViewSizeValid;
+    
+    NSString *_cachedPopUpText;
+    CGSize _cachedPopUpTextSize;
+    BOOL _cachedPopUpTextFromDataSource;
+    
+    CGFloat _cachedThumbCenterX;
+    CGRect _cachedBounds;
+    
+    CADisplayLink *_popUpViewDisplayLink;
+    BOOL _needsPopUpUpdate;
 }
 
 #pragma mark - initialization
@@ -40,6 +53,12 @@
         [self setup];
     }
     return self;
+}
+
+- (void)dealloc
+{
+    [self stopPopUpViewDisplayLink];
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 #pragma mark - public
@@ -70,6 +89,7 @@
     NSAssert(font, @"font can not be nil, it must be a valid UIFont");
     _font = font;
     [self.popUpView setFont:font];
+    [self invalidatePopUpViewCache];
 }
 
 // return the currently displayed color if possible, otherwise return _popUpViewColor
@@ -127,6 +147,7 @@
 - (void)setPopUpViewArrowLength:(CGFloat)length
 {
     self.popUpView.arrowLength = length;
+    [self invalidatePopUpViewCache];
 }
 
 - (CGFloat)popUpViewArrowLength
@@ -137,6 +158,7 @@
 - (void)setPopUpViewWidthPaddingFactor:(CGFloat)factor
 {
     self.popUpView.widthPaddingFactor = factor;
+    [self invalidatePopUpViewCache];
 }
 
 - (CGFloat)popUpViewWidthPaddingFactor
@@ -147,6 +169,7 @@
 - (void)setPopUpViewHeightPaddingFactor:(CGFloat)factor
 {
     self.popUpView.heightPaddingFactor = factor;
+    [self invalidatePopUpViewCache];
 }
 
 - (CGFloat)popUpViewHeightPaddingFactor
@@ -159,12 +182,14 @@
 {
     [super setMaximumValue:maximumValue];
     _valueRange = self.maximumValue - self.minimumValue;
+    [self invalidatePopUpViewCache];
 }
 
 - (void)setMinimumValue:(float)minimumValue
 {
     [super setMinimumValue:minimumValue];
     _valueRange = self.maximumValue - self.minimumValue;
+    [self invalidatePopUpViewCache];
 }
 
 // set max and min digits to same value to keep string length consistent
@@ -172,11 +197,13 @@
 {
     [_numberFormatter setMaximumFractionDigits:maxDigits];
     [_numberFormatter setMinimumFractionDigits:maxDigits];
+    [self invalidatePopUpViewCache];
 }
 
 - (void)setNumberFormatter:(NSNumberFormatter *)numberFormatter
 {
     _numberFormatter = [numberFormatter copy];
+    [self invalidatePopUpViewCache];
 }
 
 - (NSNumberFormatter *)numberFormatter
@@ -188,12 +215,15 @@
 {
     self.popUpViewAlwaysOn = YES;
     [self _showPopUpViewAnimated:animated];
+    _needsPopUpUpdate = YES;
+    [self updatePopUpViewIfNeeded];
 }
 
 - (void)hidePopUpViewAnimated:(BOOL)animated
 {
     self.popUpViewAlwaysOn = NO;
     [self _hidePopUpViewAnimated:animated];
+    [self stopPopUpViewDisplayLink];
 }
 
 #pragma mark - ASValuePopUpViewDelegate
@@ -211,11 +241,118 @@
 
 #pragma mark - private
 
+- (void)invalidatePopUpViewCache
+{
+    _cachedPopUpViewSizeValid = NO;
+    _cachedPopUpViewSize = CGSizeZero;
+    
+    _cachedPopUpText = nil;
+    _cachedPopUpTextSize = CGSizeZero;
+    _cachedPopUpTextFromDataSource = NO;
+    
+    _cachedThumbCenterX = CGFLOAT_MAX;
+    _cachedBounds = CGRectNull;
+}
+
+- (void)startPopUpViewDisplayLinkIfNeeded
+{
+    if (_popUpViewDisplayLink) return;
+    
+    _popUpViewDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(popUpViewDisplayLinkTick:)];
+    [_popUpViewDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+- (void)stopPopUpViewDisplayLink
+{
+    [_popUpViewDisplayLink invalidate];
+    _popUpViewDisplayLink = nil;
+}
+
+- (void)popUpViewDisplayLinkTick:(CADisplayLink *)displayLink
+{
+    if (!_needsPopUpUpdate) return;
+    _needsPopUpUpdate = NO;
+    [self updatePopUpViewIfNeeded];
+}
+
+- (BOOL)shouldUpdatePopUpView
+{
+    if (!self.window) return NO;
+    if (self.popUpViewAlwaysOn || self.tracking) return YES;
+    CALayer *layer = (CALayer *)self.popUpView.layer.presentationLayer ?: self.popUpView.layer;
+    return layer.opacity > 0.0;
+}
+
+- (void)updatePopUpViewIfNeeded
+{
+    if (![self shouldUpdatePopUpView]) return;
+    
+    NSString *valueString;
+    BOOL usingDataSourceString = NO;
+    
+    if ((valueString = [self.dataSource slider:self stringForValue:self.value]) && valueString.length != 0) {
+        usingDataSourceString = YES;
+    } else {
+        valueString = [_numberFormatter stringFromNumber:@(self.value)];
+    }
+    
+    BOOL textUnchanged = (_cachedPopUpTextFromDataSource == usingDataSourceString &&
+                          _cachedPopUpText &&
+                          [_cachedPopUpText isEqualToString:valueString]);
+    CGRect thumbRect = [self thumbRect];
+    CGFloat thumbCenterX = CGRectGetMidX(thumbRect);
+    
+    BOOL boundsUnchanged = (!CGRectIsNull(_cachedBounds) && CGRectEqualToRect(_cachedBounds, self.bounds));
+    BOOL thumbUnchanged = (_cachedThumbCenterX != CGFLOAT_MAX && fabs(thumbCenterX - _cachedThumbCenterX) < 0.01);
+    
+    if (boundsUnchanged && thumbUnchanged && textUnchanged) return;
+    
+    CGSize popUpViewSize;
+    
+    if (usingDataSourceString) {
+        if (textUnchanged && _cachedPopUpTextFromDataSource) {
+            popUpViewSize = _cachedPopUpTextSize;
+        } else {
+            popUpViewSize = [self.popUpView popUpSizeForString:valueString];
+            _cachedPopUpTextSize = popUpViewSize;
+        }
+    } else {
+        if (_cachedPopUpViewSizeValid) {
+            popUpViewSize = _cachedPopUpViewSize;
+        } else {
+            popUpViewSize = [self calculatePopUpViewSize];
+            _cachedPopUpViewSize = popUpViewSize;
+            _cachedPopUpViewSizeValid = YES;
+        }
+    }
+    
+    _cachedPopUpText = valueString;
+    _cachedPopUpTextFromDataSource = usingDataSourceString;
+    _cachedThumbCenterX = thumbCenterX;
+    _cachedBounds = self.bounds;
+    
+    CGFloat thumbW = thumbRect.size.width;
+    CGFloat thumbH = thumbRect.size.height;
+    
+    CGRect popUpRect = CGRectInset(thumbRect, (thumbW - popUpViewSize.width)/2, (thumbH - popUpViewSize.height)/2);
+    popUpRect.origin.y = thumbRect.origin.y - popUpViewSize.height;
+    
+    CGFloat minOffsetX = CGRectGetMinX(popUpRect);
+    CGFloat maxOffsetX = CGRectGetMaxX(popUpRect) - CGRectGetWidth(self.bounds);
+    
+    CGFloat offset = minOffsetX < 0.0 ? minOffsetX : (maxOffsetX > 0.0 ? maxOffsetX : 0.0);
+    popUpRect.origin.x -= offset;
+    
+    [self.popUpView setFrame:popUpRect arrowOffset:offset text:valueString];
+}
+
 - (void)setup
 {
     _autoAdjustTrackColor = YES;
     _valueRange = self.maximumValue - self.minimumValue;
     _popUpViewAlwaysOn = NO;
+    _needsPopUpUpdate = NO;
+    [self invalidatePopUpViewCache];
 
     NSNumberFormatter *formatter = [[NSNumberFormatter alloc] init];
     [formatter setNumberStyle:NSNumberFormatterDecimalStyle];
@@ -325,13 +462,18 @@
 -(void)layoutSubviews
 {
     [super layoutSubviews];
-    [self updatePopUpView];
+    if (self.tracking) {
+        _needsPopUpUpdate = YES;
+        return;
+    }
+    [self updatePopUpViewIfNeeded];
 }
 
 - (void)didMoveToWindow
 {
     if (!self.window) { // removed from window - cancel notifications
         [[NSNotificationCenter defaultCenter] removeObserver:self];
+        [self stopPopUpViewDisplayLink];
     }
     else { // added to window - register notifications
         
@@ -352,6 +494,12 @@
     [self.popUpView setAnimationOffset:[self currentValueOffset] returnColor:^(UIColor *opaqueReturnColor) {
         super.minimumTrackTintColor = opaqueReturnColor;
     }];
+    if (self.tracking) {
+        _needsPopUpUpdate = YES;
+        [self startPopUpViewDisplayLinkIfNeeded];
+    } else {
+        [self updatePopUpViewIfNeeded];
+    }
 }
 
 - (void)setValue:(float)value animated:(BOOL)animated
@@ -363,11 +511,18 @@
                 [self.popUpView setAnimationOffset:[self currentValueOffset] returnColor:^(UIColor *opaqueReturnColor) {
                     super.minimumTrackTintColor = opaqueReturnColor;
                 }];
+                [self updatePopUpViewIfNeeded];
                 [self layoutIfNeeded];
             }];
         }];
     } else {
         [super setValue:value animated:animated];
+        if (self.tracking) {
+            _needsPopUpUpdate = YES;
+            [self startPopUpViewDisplayLinkIfNeeded];
+        } else {
+            [self updatePopUpViewIfNeeded];
+        }
     }
 }
 
@@ -380,7 +535,12 @@
 - (BOOL)beginTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event
 {
     BOOL begin = [super beginTrackingWithTouch:touch withEvent:event];
-    if (begin && !self.popUpViewAlwaysOn) [self _showPopUpViewAnimated:YES];
+    if (begin) {
+        _needsPopUpUpdate = YES;
+        [self startPopUpViewDisplayLinkIfNeeded];
+        [self updatePopUpViewIfNeeded];
+        if (!self.popUpViewAlwaysOn) [self _showPopUpViewAnimated:YES];
+    }
     return begin;
 }
 
@@ -391,6 +551,8 @@
         [self.popUpView setAnimationOffset:[self currentValueOffset] returnColor:^(UIColor *opaqueReturnColor) {
             super.minimumTrackTintColor = opaqueReturnColor;
         }];
+        _needsPopUpUpdate = YES;
+        [self startPopUpViewDisplayLinkIfNeeded];
     }
     return continueTrack;
 }
@@ -398,12 +560,18 @@
 - (void)cancelTrackingWithEvent:(UIEvent *)event
 {
     [super cancelTrackingWithEvent:event];
+    _needsPopUpUpdate = YES;
+    [self updatePopUpViewIfNeeded];
+    [self stopPopUpViewDisplayLink];
     if (self.popUpViewAlwaysOn == NO) [self _hidePopUpViewAnimated:YES];
 }
 
 - (void)endTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event
 {
     [super endTrackingWithTouch:touch withEvent:event];
+    _needsPopUpUpdate = YES;
+    [self updatePopUpViewIfNeeded];
+    [self stopPopUpViewDisplayLink];
     if (self.popUpViewAlwaysOn == NO) [self _hidePopUpViewAnimated:YES];
 }
 
